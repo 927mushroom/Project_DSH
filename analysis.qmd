@@ -1,0 +1,1291 @@
+---
+title: "공간적 자기상관을 고려한 <br> 기계학습 기반 침수 위험 지역 예측"
+subtitle: "- Spatial Random Forest Modeling with Eigenvector Spatial Filtering"
+date: "Submission date: `r Sys.setlocale('LC_TIME','C'); format(Sys.Date(), format='%B %d, %Y')`"
+author: "인문대학 고고미술사학과 <br> 2019-13439 <br> 정송희"
+format: 
+ html:
+  toc: true
+  code-fold: false
+  code-tools: true
+  fontsize: 12pt
+  theme: yeti
+  page-layout: full
+editor: visual
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	cache = FALSE,
+	comment = NA,
+	prompt = FALSE,
+	tidy = TRUE)
+```
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(rmarkdown)
+library(corrplot)
+library(sf)
+library(terra)
+library(tmap)
+library(whitebox)
+library(spatialEco)
+library(car)
+library(tidymodels)
+library(rpart.plot)
+library(vip)
+library(randomForest)
+library(adespatial)
+library(ade4)
+library(adegraphics)
+library(spdep)
+library(maptools)
+library(spatialRF)
+library(randomForestExplainer)
+library(doParallel)
+```
+
+![](201913439_정송희_포스터.png){fig-align="center"}
+
+# 1. Data
+
+## Variables
+
+| 대분류             | 중분류           | 소분류                                                        |
+|----------------|----------------|-----------------------------------------|
+| Feature (예측변수) | Terrain (지형)   | Elevation (고도)                                              |
+| Feature (예측변수) | Terrain (지형)   | Slope (경사도)                                                |
+| Feature (예측변수) | Terrain (지형)   | Curvature (곡률)                                              |
+| Feature (예측변수) | Hydrology (수문) | Topographic Wetness Index; TWI (지형 습윤 지수)               |
+| Feature (예측변수) | Hydrology (수문) | Distance from River (강으로부터의 거리)                       |
+| Feature (예측변수) | Hydrology (수문) | Distance from Sea (바다로부터의 거리)                         |
+| Feature (예측변수) | Cover (피복)     | Normalized Difference Vegetation Index; NDVI (정규 식생 지수) |
+| Feature (예측변수) | Cover (피복)     | Normalized Difference Built-up Index; NDBI (정규 시가화 지수) |
+| Feature (예측변수) | Cover (피복)     | Soil Drain (토양 배수 등급)                                   |
+| Feature (예측변수) | Drainage (배수)  | Manhole (맨홀 개수)                                           |
+| Feature (예측변수) | Drainage (배수)  | Pump Station (유역면적 대비 배수 펌프장 용량)                 |
+| Target (결과 변수) |                  | Occurrence of Flood (침수 여부)                               |
+
+## Source
+
+-   시도/시군구 경계 (국토지리정보원)<br> <http://data.nsdi.go.kr/dataset/20171206ds00001> <br>
+
+-   수치표고모형 (USGS)<br> <https://earthexplorer.usgs.gov/> <br>
+
+-   실폭하천 (국토지리정보원)<br> <http://data.nsdi.go.kr/dataset/20180927ds0048> <br>
+
+-   해안선 (국토지리정보원)<br> <http://data.nsdi.go.kr/dataset/20180927ds0050> <br>
+
+-   토양환경정보도 (농촌진흥청)<br> <http://soil.rda.go.kr/geoweb/soilmain.do> <br>
+
+-   Landsat8 위성영상 (USGS)<br> <https://earthexplorer.usgs.gov/> <br>
+
+-   하수맨홀 (부산광역시)<br> <https://www.data.go.kr/data/15084501/fileData.do?recommendDataYn=Y> <br>
+
+-   배수펌프장 용량 (부산광역시)<br> <https://www.data.go.kr/data/3076447/fileData.do> <br>
+
+-   침수위선 (국토지리정보원)<br> <http://data.nsdi.go.kr/nl/dataset/20200708ds00011> <br>
+
+## Load
+
+```{r}
+# study area
+area <- st_read("data/shp/Busan.shp")
+
+# target variable
+floodtype <- st_read("data/shp/Flood_region.shp")
+floodtype <- st_transform(floodtype, crs(area))
+
+# Feature variable
+## Terrain
+### Elevation
+#raw_1 <- rast("data/raster/n34_e128_1arc_v3.tif")
+#raw_2 <- rast("data/raster/n34_e129_1arc_v3.tif")
+#raw_3 <- rast("data/raster/n35_e128_1arc_v3.tif")
+#raw_4 <- rast("data/raster/n35_e129_1arc_v3.tif")
+#dem <- mosaic(raw_1, raw_2, raw_3, raw_4)
+#dem <- project(dem, crs(area))
+#writeRaster(dem, "data/raster/DEM.tif", overwrite = TRUE)
+dem <- rast("data/raster/DEM.tif")
+### Slope
+#wbt_slope(dem = "data/raster/DEM_filled_breached.tif",
+          #output = "data/raster/Slope.tif",
+          #units = "degrees")
+slope <- rast("data/raster/Slope.tif")
+### Curvature
+#curv <- curvature(dem, type = "total")
+#writeRaster(curv, "data/raster/Curv.tif", overwrite=TRUE)
+curv <- rast("data/raster/Curv.tif")
+curv[is.na(curv)] <- 0
+## Hydrology
+### Topographic Wetness Index
+#wbt_breach_depressions_least_cost(
+  #dem = "data/raster/DEM.tif",
+  #output = "data/raster/DEM_breached.tif",
+  #dist = 5,
+  #fill = TRUE)
+#wbt_fill_depressions_wang_and_liu(
+  #dem = "data/raster/DEM_breached.tif",
+  #output = "data/raster/DEM_filled_breached.tif")
+#wbt_d_inf_flow_accumulation("data/raster/DEM_filled_breached.tif",
+                            #"data/raster/DEM_flowaccum.tif")
+#wbt_wetness_index(sca = "data/raster/DEM_flowaccum.tif",
+                  #slope = "data/raster/Slope.tif",
+                  #output = "data/raster/TWI.tif")
+twi <- rast("data/raster/TWI.tif")
+### Distance from Stream
+area_rast <- dem
+area_rast[] <- 0
+stream <- st_read("data/shp/River_BUSAN.shp")
+stream <- st_transform(stream, crs(area))
+dist_str <- terra::distance(rasterize(stream, area_rast))
+### Distance from Coastline
+coastline <- st_read("data/shp/Coastline_BUSAN.shp")
+coastline <- st_transform(coastline, crs(area))
+dist_coast <- terra::distance(rasterize(coastline, area_rast))
+## Cover
+### NDVI
+#Nor_B4 <- rast("data/raster/LC08_L2SP_114035_20230407_20230420_02_T1_SR_B4.tif")
+#Nor_B5 <- rast("data/raster/LC08_L2SP_114035_20230407_20230420_02_T1_SR_B5.tif")
+#Sou_B4 <- rast("data/raster/LC08_L2SP_114036_20230407_20230420_02_T1_SR_B4.tif")
+#Sou_B5 <- rast("data/raster/LC08_L2SP_114036_20230407_20230420_02_T1_SR_B5.tif")
+#LST_Band4 <- mosaic(Nor_B4, Sou_B4)
+#LST_Band5 <- mosaic(Nor_B5, Sou_B5)
+#red <- LST_Band4[[1]]
+#nir <- LST_Band5[[1]]
+#ndviCal <- function(red, nir) {
+    #ndviArray <- (nir - red)/(nir + red)
+    #return(ndviArray)
+    #}
+#ndvi <- ndviCal(red,nir)
+#ndvi <- project(ndvi, crs(area))
+#writeRaster(ndvi,"data/raster/NDVI.tif", overwrite = TRUE)
+ndvi <- rast("data/raster/NDVI.tif")
+ndvi <- resample(ndvi, dem)
+### NDBI
+#Nor_B6 <- rast("data/raster/LC08_L2SP_114035_20230407_20230420_02_T1_SR_B6.tif")
+#Sou_B6 <- rast("data/raster/LC08_L2SP_114036_20230407_20230420_02_T1_SR_B6.tif")
+#LST_Band6 <- mosaic(Nor_B6, Sou_B6)
+#nir <- LST_Band5[[1]]
+#swir <- LST_Band6[[1]]
+#ndbiCal <- function(nir, swir) {
+   #ndbiArray <- (swir - nir)/(swir + nir)
+   #return(ndbiArray)
+   #}
+#ndbi <- ndbiCal(nir, swir)
+#ndbi <- project(ndbi, crs(area))
+#writeRaster(ndbi,"data/raster/NDBI.tif", overwrite = TRUE)
+ndbi <- rast("data/raster/NDBI.tif")
+ndbi <- resample(ndbi, dem)
+## Drainage
+### Soil Drain
+drain <- st_read("data/shp/Z_SIS_ASIT_SOILDRAIN_AREA_BUSAN.shp")
+drain <- st_transform(drain, crs(area))
+drain$SOILDRA <- as.numeric(drain$SOILDRA)
+### Manhole
+area_emd <- st_read("data/shp/Z_SOP_BND_ADM_DONG_PG.shp", options = "ENCODING=CP949")
+area_emd <- area_emd %>% filter(str_starts(ADM_DR_CD, '21'))
+area_emd <- st_transform(area_emd, crs(area))
+area_emd$area <- st_area(area_emd)
+manhole <- read_csv("data/table/부산광역시_부산도시공간정보시스템_도로상하수도기반시설물_하수맨홀.csv")
+colnames(manhole)[7] <- "ADM_DR_NM"
+manhole <- manhole %>% group_by(ADM_DR_NM) %>% summarize(count = n())
+manhole <- area_emd %>% left_join(manhole)
+manhole[is.na(manhole)] <- 0
+manhole$count <- as.numeric(manhole$count)
+manhole <- manhole %>% mutate("manhole" = count/area)
+### Pump
+pump <- read_csv("./data/table/부산광역시_배수 펌프장 현황_20230324.csv")[c(1,2,3,8)]
+basin <- st_read("./data/shp/Busan_basin.shp")
+basin <- st_transform(basin, crs(area))
+clientId <-  "4kb73whdwq"
+clientSecret <- "1y4snfRusPuUQmnDUNySoZmubznDyC1BfeuHrtWH"
+no_cores <- detectCores(logical = F) - 1  
+cl <- makeCluster(no_cores, type="PSOCK")  
+registerDoParallel(cl)  
+result <- foreach(i=1:length(pump$위치),.combine = dplyr::bind_rows, .packages = c("dplyr","httr","XML")) %dopar% {
+  apiResult <- httr::GET( 
+    url = "https://naveropenapi.apigw.ntruss.com/map-geocode/v2/geocode", 
+    httr::add_headers(
+      `X-NCP-APIGW-API-KEY-ID` = clientId, 
+      `X-NCP-APIGW-API-KEY` = clientSecret
+    ),
+    query = list(
+      `query` = pump$위치[i]
+    )
+  )
+  if (apiResult$status_code == "200"){
+    #print("ResultCode OK!")
+    result <- base::rawToChar(apiResult$content)  
+    base::Encoding(result) <- "UTF-8"
+    list <- XML::xmlToList(result)
+    if (base::is.null(x = list$addresses$x)){
+      x <- -1e7+1
+      y <- -1e7+1
+    }
+    else {
+      x <- base::as.numeric(list$addresses$x)
+      y <- base::as.numeric(list$addresses$y)
+    }
+  }
+  else if (apiResult$status_code == "400"){
+    base::cat(paste("Bad Request Exception in",pump$배수펌프장명[i]))
+  }
+  else if (apiResult$status_code == "500"){
+    base::cat(paste("Unexpected Error in",pump$배수펌프장명[i]))
+  }
+  else{
+    base::cat("몰라요")
+  }
+  base::cbind(pump[i,],x,y) |> as_tibble()
+}
+stopCluster(cl)
+result <- result %>% filter(x >= 127)
+sf_pump <- st_as_sf(result, coords = c("x", "y"), 
+                    crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(basin))
+joined <- st_join(sf_pump, basin, join = st_intersects)
+joined$SBSNNM <- as.character(joined$SBSNNM)
+joined$`배수량(제곱미터_분)` <- as.numeric(joined$`배수량(제곱미터_분)`)
+joined <- joined %>% rename("배수량" = "배수량(제곱미터_분)")
+pump_joind <- joined %>% st_drop_geometry() %>% 
+  group_by(SBSNNM) %>% 
+  summarise(sum = sum(배수량))
+pump_joind <- na.omit(pump_joind)
+pump_joind <- basin %>% left_join(pump_joind)
+pump_joind[is.na(pump_joind)] <- 0
+pump_joind$area <- st_area(pump_joind)
+pump <- pump_joind %>% mutate("ratio" = sum/area)
+
+v_dem <- mask(dem, area)
+v_slope <- mask(slope, area)
+v_curv <- mask(curv, area)
+v_twi <- mask(twi, area)
+v_dist_str <- mask(dist_str, area)
+v_dist_coast <- mask(dist_coast, area)
+v_ndvi <- mask(ndvi, area)
+v_ndbi <- mask(ndbi, area)
+v_dem <- crop(v_dem, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_slope <- crop(v_slope, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_curv <- crop(v_curv, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_twi <- crop(v_twi, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_dist_str <- crop(v_dist_str, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_dist_coast <- crop(v_dist_coast, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_ndvi <- crop(v_ndvi, ext(c(1110000, 1170000, 1650000, 1720000)))
+v_ndbi <- crop(v_ndbi, ext(c(1110000, 1170000, 1650000, 1720000)))
+```
+
+# 2. Variable
+
+## Feature
+
+### Terrain
+
+```{r}
+tmap_mode("plot")
+
+tm_shape(v_dem) +
+  tm_raster(style = "cont", palette = "-YlGn", legend.show = TRUE, title = "elevation")
+
+tm_shape(v_slope) +
+  tm_raster(style = "cont", palette = "YlGnBu", legend.show = TRUE, title = "slope")
+
+tm_shape(v_curv) +
+  tm_raster(style = "cont", palette = "PuOr", legend.show = TRUE, title = "curvature")
+```
+
+### Hydrology
+
+```{r}
+tm_shape(v_twi) +
+  tm_raster(style = "cont", palette = "Blues", legend.show = TRUE, title = "twi") 
+
+tm_shape(area) + tm_fill(col = 'darkgrey') +
+ tm_shape(stream) + tm_fill(col = "skyblue")
+tm_shape(v_dist_str) +
+ tm_raster(style = "cont", palette = "-Blues", legend.show = TRUE, title = "dist_str")
+
+tm_shape(area) + tm_fill(col = 'darkgrey') +
+ tm_shape(coastline) + tm_lines(col = "skyblue")
+tm_shape(v_dist_coast) +
+ tm_raster(style = "cont", palette = "-Blues", legend.show = TRUE, title = "dist_coast")
+```
+
+### Cover
+
+```{r}
+tm_shape(v_ndvi) +
+  tm_raster(style = "cont", palette = "RdYlGn", legend.show = TRUE, title = "ndvi")
+
+tm_shape(v_ndbi) +
+  tm_raster(style = "cont", palette = "-PiYG", legend.show = TRUE, title = "ndbi") 
+
+tm_shape(drain) +
+ tm_fill(col = "SOILDRA", title = "Drain") +
+ tm_legend(outside = TRUE)
+```
+
+### Drainage
+
+```{r}
+tm_shape(manhole) +
+ tm_polygons('count', palette = "BuPu", title = "manhole") +
+ tm_legend(outside = TRUE)
+
+tm_shape(basin) + tm_polygons() +
+  tm_shape(sf_pump) + tm_dots(col = "#FC4E07", size = 0.05)
+
+tm_shape(pump) + 
+  tm_polygons('ratio', palette = "Reds") +
+  tm_layout(legend.outside = TRUE)
+```
+
+## Target
+
+```{r}
+tm_shape(floodtype) + tm_fill(col = "type", palette = "RdGy", title = "Flood") +
+ tm_legend(outside = TRUE)
+```
+
+# 3. Summary
+
+## Statistics
+
+```{r}
+drain <- rasterize(drain, area_rast, field = "SOILDRA")
+manhole <- rasterize(manhole, area_rast, field = "manhole")
+pump <- rasterize(pump, area_rast, field = "ratio")
+drain <- as.numeric(drain)
+manhole <- as.numeric(manhole)
+pump <- as.numeric(pump)
+
+df_pred <- c(dem, slope, curv, twi, dist_str, dist_coast, ndvi, ndbi, drain, manhole, pump)
+df_dep <- rasterize(floodtype, area_rast, field = "type")
+df_dep[is.na(df_dep)] <- 0
+df <- c(df_pred, df_dep)
+names(df) <- c("dem", "slope", "curv", "twi", "dist_str", "dist_coast", "ndvi", "ndbi", "drain", "manhole", "pump", "type")
+
+df_busan <- mask(df, area)
+df_table <- as.data.frame(df_busan)
+df_table$type <- as.factor(df_table$type)
+df_table <- na.omit(df_table)
+summary(df_table)
+```
+
+## Histogram
+
+```{r}
+ggplot(data = df_table, mapping = aes(x = dem, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = slope, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = curv, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = twi, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = dist_str, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = dist_coast, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = ndvi, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+ggplot(data = df_table, mapping = aes(x = ndbi, fill = type, color = type)) +
+ geom_density(alpha = 0.5, position = "identity")
+```
+
+## Scatterplot
+
+```{r}
+df_cor <- df_table[c(-12)]
+df_cor <- cor(df_cor)
+corrplot(df_cor, type="full", order="hclust", tl.col="black", tl.srt=45)
+```
+
+# 4. Point Sampling
+
+```{r}
+flood <- st_read("data/shp/Flood_area.shp")
+flood <- st_transform(flood, crs(area))
+nonflood <- st_read("data/shp/Nonflood_area.shp")
+nonflood <- st_transform(nonflood, crs(area))
+
+rp_T <- st_sample(flood, 250)
+rp_T_att = data.frame(type = "TRUE")
+rp_T = st_sf(rp_T_att, geometry = rp_T)
+rp_F <- st_sample(nonflood, 250)
+rp_F_att = data.frame(type = "FALSE")
+rp_F = st_sf(rp_F_att, geometry = rp_F)
+ran_points <- rbind(rp_T, rp_F)
+
+df_points <- terra::extract(df, ran_points)
+df_points <- cbind(ran_points[c(-1)], df_points[c(-1)])
+df_points <- na.omit(df_points)
+st_geometry(df_points) <- "geometry"
+
+tm_shape(area) + tm_fill(col = 'darkgrey') +
+ tm_shape(df_points) + tm_dots(col = "type", size = 0.1, palette = "RdBu")
+```
+
+# 5. Random Forest Modeling
+
+## SpatialRF
+
+### Define Spatial Neighborhood
+
+```{r}
+# names of the response variable and the predictors
+df_points_rf <- df_points %>% st_drop_geometry()
+df_points$type <- as.numeric(df_points$type)
+df_points_gwrf <- df_points %>% st_drop_geometry()
+dependent_variable_name <- "type"
+predictor_variable_names <-  c("dem", "slope", "curv", "twi", "dist_str", "dist_coast", "ndvi", "ndbi", "drain", "manhole", "pump")
+
+# coordinates of the cases
+pcoord <- df_points %>%
+    mutate(lon = st_coordinates(.)[, 1], lat = st_coordinates(.)[, 2]) %>%
+    dplyr::select(lon, lat)
+pcoord <- pcoord %>%
+    st_drop_geometry()
+colnames(pcoord) <- c("x", "y")
+
+# distance matrix
+distance_matrix <- st_distance(df_points)
+distance_matrix <- as.matrix(distance_matrix)
+units(distance_matrix) <- NULL
+
+# distance thresholds (same units as distance_matrix)
+distance_thresholds <- c(0, 1000, 2000, 4000, 8000, 16000, 32000)
+
+# random seed for reproducibility
+random_seed <- 1
+```
+
+```{r}
+spatialRF::plot_training_df(
+  data = df_points_gwrf,
+  dependent.variable.name = dependent_variable_name,
+  predictor.variable.names = predictor_variable_names,
+  ncol = 3,
+  point.color = viridis::viridis(100, option = "F"),
+  line.color = "gray30"
+  )
+```
+
+### Fitting
+
+```{r}
+model.non.spatial <- spatialRF::rf(
+  data = df_points_gwrf,
+  dependent.variable.name = dependent_variable_name,
+  predictor.variable.names = predictor_variable_names,
+  distance.matrix = distance_matrix,
+  distance.thresholds = distance_thresholds,
+  xy = pcoord, #not needed by rf, but other functions read it from the model
+  seed = random_seed,
+  verbose = FALSE
+)
+```
+
+### Feature Importance
+
+```{r}
+spatialRF::plot_importance(
+  model.non.spatial,
+  verbose = FALSE
+  )
+
+model.non.spatial <- spatialRF::rf_importance(
+  model = model.non.spatial
+  )
+```
+
+### Local Importance of Feature
+
+```{r}
+local.importance <- spatialRF::get_importance_local(model.non.spatial)
+local.importance <- cbind(pcoord, local.importance)
+
+color.low <- viridis::viridis(1)
+color.high <- viridis::viridis(5)
+
+p1 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = dem)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Elevation") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p2 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = slope)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Slope") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p3 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = curv)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Curvature") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p4 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = twi)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of TWI") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p5 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = dist_str)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Distance from Stream") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p6 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = dist_coast)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Distance from Coast") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p7 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = ndvi)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of NDVI") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p8 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = ndbi)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of NDBI") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p9 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = drain)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Drain") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p10 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = area,
+    fill = "white") +
+  ggplot2::geom_point(
+    data = local.importance,
+    ggplot2::aes(
+      x = x,
+      y = y,
+      color = manhole)) +
+ ggplot2::scale_color_gradient2(
+    low = color.low, 
+    high = color.high) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom") + 
+  ggplot2::ggtitle("Local Importance of Manhole") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5),
+    legend.key.width = ggplot2::unit(1,"cm")) + 
+  ggplot2::labs(color = "Importance") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+
+p1 | p2 
+p3 | p4
+p5 | p6
+p7 | p8
+p9 | p10
+```
+
+### Response Curve
+
+```{r}
+spatialRF::plot_response_curves(
+  model.non.spatial,
+  quantiles = c(0.1, 0.5, 0.9),
+  line.color = viridis::viridis(3,
+    option = "F", 
+    end = 0.9),
+  ncol = 3,
+  show.data = TRUE)
+```
+
+### Partial Dependence Plot
+
+```{r}
+spatialRF::plot_response_surface(
+  model.non.spatial,
+  a = "dem",
+  b = "twi")
+
+pdp::partial(
+  model.non.spatial, 
+  train = df_points_gwrf, 
+  pred.var = c("dem", "twi"), 
+  plot = TRUE)
+```
+
+### Cross Validation
+
+```{r}
+model.non.spatial <- spatialRF::rf_evaluate(
+  model = model.non.spatial,
+  xy = pcoord,             
+  repetitions = 30,         
+  training.fraction = 0.75,
+  metrics = "r.squared",
+  seed = random_seed,
+  verbose = FALSE
+)
+
+pr <- pcoord[, c("x", "y")]
+pr$group.2 <- pr$group.1 <- "Training"
+pr[model.non.spatial$evaluation$spatial.folds[[1]]$testing, "group.1"] <- "Testing"
+pr[model.non.spatial$evaluation$spatial.folds[[25]]$testing, "group.2"] <- "Testing"
+
+p1 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = area, fill = "white") +
+  ggplot2::geom_point(data = pr,
+          ggplot2::aes(
+            x = x,
+            y = y,
+            color = group.1
+            ),
+          size = 2
+          ) +
+  ggplot2::scale_color_viridis_d(
+    direction = -1, 
+    end = 0.5, 
+    alpha = 0.8, 
+    option = "F"
+    ) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(color = "Group") +
+  ggplot2::ggtitle("Spatial fold 1") + 
+  ggplot2::theme(
+    legend.position = "none", 
+    plot.title = ggplot2::element_text(hjust = 0.5)
+  ) + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("Latitude")
+
+p2 <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = area, fill = "white") +
+  ggplot2::geom_point(data = pr,
+          ggplot2::aes(
+            x = x,
+            y = y,
+            color = group.2
+            ),
+          size = 2
+          ) +
+  ggplot2::scale_color_viridis_d(
+    direction = -1, 
+    end = 0.5, 
+    alpha = 0.8, 
+    option = "F"
+    ) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(color = "Group") +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5)
+  ) + 
+  ggplot2::ggtitle("Spatial fold 25") + 
+  ggplot2::xlab("Longitude") + 
+  ggplot2::ylab("")
+
+p1 | p2
+```
+
+## Tidymodel
+
+### Data Split
+
+```{r}
+df_points$type <- as.factor(df_points$type)
+df_points$manhole <- as.numeric(df_points$manhole)
+
+df_split <- rsample::initial_split(df_points_rf, prop = 7/10)
+train <- rsample::training(df_split)
+df_train <- train %>% st_drop_geometry()
+test <- rsample::testing(df_split)
+df_test <- test %>% st_drop_geometry()
+```
+
+### Hyperparameter Tuning
+
+```{r}
+rf_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+    set_engine("randomForest", importance = TRUE) %>%
+    set_mode("classification")
+
+rf_recipe <- recipe(type ~ ., data = df_train)
+
+rf_workflow <- workflow() %>%
+    add_model(rf_mod) %>%
+    add_recipe(rf_recipe)
+
+val_set <- validation_split(df_train)
+
+rf_res <- rf_workflow %>%
+    tune_grid(val_set,
+              grid = 20,
+              control = control_grid(save_pred = T),
+              metrics = metric_set(roc_auc))
+
+rf_res %>%
+    show_best(metric = "roc_auc")
+
+autoplot(rf_res)
+
+rf_best <- rf_res %>%
+    select_best(metric = "roc_auc")
+```
+
+### Fitting
+
+```{r}
+last_rf_mod <- finalize_model(rf_mod, rf_best)
+
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(df_split)
+```
+
+### Feature Importance
+
+```{r}
+fi <- last_rf_fit %>% 
+ pluck(".workflow", 1) %>% 
+ pull_workflow_fit() %>% 
+ vip()
+fi <- fi$data
+
+ggplot(data = fi, mapping = aes(x = Importance, y = reorder(Variable, Importance))) +
+ geom_segment(aes(xend = 0, yend = Variable), color = "grey") +
+ geom_point(aes(color = Importance, size = 5), show.legend = FALSE) +
+ scale_color_gradient2(midpoint = mean(fi$Importance), low = "#FDE725FF", mid = "#1F968BFF", high = "#440154FF") +
+ theme_bw() +
+ theme(axis.title.y = element_blank())
+```
+
+### Performance
+
+```{r}
+last_rf_fit %>% 
+  collect_metrics()
+
+rf_roc <- last_rf_fit %>% 
+ collect_predictions() %>% 
+ roc_curve(type, .pred_FALSE) %>%
+ mutate(model = 'Random Forest')
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(type, .pred_FALSE) %>% 
+  autoplot()
+```
+
+# 6. Spatial Effect
+
+```{r}
+spatialRF::plot_training_df_moran(
+  data = df_points_gwrf,
+  dependent.variable.name = dependent_variable_name,
+  predictor.variable.names = predictor_variable_names,
+  distance.matrix = distance_matrix,
+  distance.thresholds = distance_thresholds,
+  fill.color = viridis::viridis(100, option = "F", direction = -1),
+  point.color = "gray40"
+)
+
+spatialRF::plot_residuals_diagnostics(
+  model.non.spatial,
+  verbose = FALSE
+  )
+
+spatialRF::plot_moran(
+  model.non.spatial, 
+  verbose = FALSE)
+```
+
+# 7. Spatial Random Forest Modeling
+
+## Spatial RF
+
+### Fitting
+
+```{r}
+model.spatial <- spatialRF::rf_spatial(
+  model = model.non.spatial,
+  method = "mem.moran.sequential", #default method
+  verbose = FALSE,
+  seed = random_seed
+  )
+
+spatialRF::plot_moran(
+  model.spatial, 
+  verbose = FALSE
+  )
+```
+
+### Feature Importance
+
+```{r}
+p1 <- spatialRF::plot_importance(
+  model.non.spatial,
+  fill.color = c("#FDE725FF", "#1F968BFF", "#440154FF"),
+  line.color = "black",
+  verbose = FALSE) + 
+  ggplot2::ggtitle("Non-spatial model") 
+
+p2 <- spatialRF::plot_importance(
+  model.spatial,
+  fill.color = c("#FDE725FF", "#1F968BFF", "#440154FF"),
+  line.color = "black",
+  verbose = FALSE) + 
+  ggplot2::ggtitle("Spatial model")
+
+p1 | p2 
+```
+
+```{r}
+model.spatial.repeat <- spatialRF::rf_repeat(
+  model = model.spatial, 
+  repetitions = 30,
+  seed = random_seed,
+  verbose = FALSE
+)
+```
+
+```{r}
+spatialRF::plot_importance(
+  model.spatial.repeat,
+  fill.color = c("#FDE725FF", "#1F968BFF", "#440154FF"),
+  line.color = "black",
+  verbose = FALSE
+  )
+```
+
+### Response Curve
+
+```{r}
+spatialRF::plot_response_curves(
+  model.spatial.repeat, 
+  quantiles = 0.5,
+  ncol = 3
+  )
+```
+
+### Make Spatial Predictors
+
+```{r}
+spatial.predictors <- spatialRF::get_spatial_predictors(model.spatial)
+pr <- data.frame(spatial.predictors, pcoord[, c("x", "y")])
+```
+
+### Optimization
+
+```{r}
+p_opt <- spatialRF::plot_optimization(model.spatial)
+```
+
+## Tidymodel
+
+### Make Spatial Predictor
+
+```{r}
+mems <- spatialRF::mem_multithreshold(
+  distance.matrix = distance_matrix,
+  distance.thresholds = distance_thresholds
+)
+
+mem.rank <- spatialRF::rank_spatial_predictors(
+  distance.matrix = distance_matrix,
+  spatial.predictors.df = mems,
+  ranking.method = "moran"
+)
+
+
+model.formula <- as.formula(
+  paste(
+    dependent_variable_name,
+    " ~ ",
+    paste(
+      predictor_variable_names,
+      collapse = " + "
+    )
+  )
+)
+
+#scaling the data
+model.data <- scale(df_points_gwrf) %>% 
+  as.data.frame()
+
+#fitting the model
+m <- lm(model.formula, data = model.data)
+
+#Moran's I test of the residuals
+moran.test <- spatialRF::moran(
+  x = residuals(m),
+  distance.matrix = distance_matrix,
+  verbose = FALSE
+)
+moran.test$plot
+
+#add mems to the data and applies scale()
+model.data <- data.frame(
+  df_points_gwrf,
+  mems
+) %>%
+  scale() %>%
+  as.data.frame()
+
+#initialize predictors.i
+predictors.i <- predictor_variable_names
+
+#iterating through MEMs
+for(mem.i in colnames(mems)){
+  
+  #add mem name to model definintion
+  predictors.i <- c(predictors.i, mem.i)
+  
+  #generate model formula with the new spatial predictor
+  model.formula.i <- as.formula(
+    paste(
+      dependent_variable_name,
+      " ~ ",
+      paste(
+        predictors.i,
+        collapse = " + "
+      )
+    )
+  )
+  
+  #fit model
+  m.i <- lm(model.formula.i, data = model.data)
+  
+  #Moran's I test
+  moran.test.i <- moran(
+    x = residuals(m.i),
+    distance.matrix = distance_matrix,
+    verbose = FALSE
+  )
+  
+  #stop if no autocorrelation
+  if(moran.test.i$test$interpretation == "No spatial correlation"){
+    break
+  }
+  
+}#end of loop
+
+#last moran test
+moran.test.i$plot
+```
+
+### Data Split
+
+```{r}
+rank_mems <- mems[, mem.rank$ranking]
+mems <- mems[1:length(predictors.i)]
+df_points_gwrf <- cbind(df_points_rf, mems)
+
+df_split <- rsample::initial_split(df_points_gwrf, prop = 7/10)
+train <- rsample::training(df_split)
+df_train <- train %>% st_drop_geometry()
+test <- rsample::testing(df_split)
+df_test <- test %>% st_drop_geometry()
+```
+
+### Hyperparameter Tuning
+
+```{r}
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+gwrf_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+    set_engine("randomForest", importance = TRUE) %>%
+    set_mode("classification")
+
+gwrf_recipe <- recipe(type ~ ., data = df_train)
+
+gwrf_workflow <- workflow() %>%
+    add_model(gwrf_mod) %>%
+    add_recipe(gwrf_recipe)
+
+gwrf_val_set <- validation_split(df_train)
+
+gwrf_res <- gwrf_workflow %>%
+    tune_grid(gwrf_val_set,
+              grid = 20,
+              control = control_grid(save_pred = T),
+              metrics = metric_set(roc_auc))
+
+gwrf_res %>%
+    show_best(metric = "roc_auc")
+
+autoplot(gwrf_res)
+
+gwrf_best <- gwrf_res %>%
+    select_best(metric = "roc_auc")
+```
+
+### Fitting
+
+```{r}
+last_gwrf_mod <- finalize_model(gwrf_mod, gwrf_best)
+
+last_gwrf_workflow <- 
+  gwrf_workflow %>% 
+  update_model(last_gwrf_mod)
+
+last_gwrf_fit <- 
+  last_gwrf_workflow %>% 
+  last_fit(df_split)
+```
+
+### Feature Importance
+
+```{r}
+fi <- last_gwrf_fit %>% 
+ pluck(".workflow", 1) %>% 
+ pull_workflow_fit() %>% 
+ vip()
+fi <- fi$data
+
+ggplot(data = fi, mapping = aes(x = Importance, y = reorder(Variable, Importance))) +
+ geom_segment(aes(xend = 0, yend = Variable), color = "grey") +
+ geom_point(aes(color = Importance, size = 5), show.legend = FALSE) +
+ scale_color_gradient2(midpoint = mean(fi$Importance), low = "#FDE725FF", mid = "#1F968BFF", high = "#440154FF") +
+ theme_bw() +
+ theme(axis.title.y = element_blank())
+```
+
+### Performance
+
+```{r}
+last_gwrf_fit %>% 
+  collect_metrics()
+
+gwrf_roc <- last_gwrf_fit %>% 
+ collect_predictions() %>% 
+ roc_curve(type, .pred_FALSE) %>%
+ mutate(model = 'Random Forest')
+
+last_gwrf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(type, .pred_FALSE) %>% 
+  autoplot()
+```
+
+# 8. Model Comparison
+
+## ROC Curve
+
+```{r}
+gwrf_roc$model <- "Spatial Random Forest"
+  
+bind_rows(rf_roc, gwrf_roc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model))+
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) +
+  scale_color_manual(values = c("darkgray", "#0B2171")) +
+  coord_equal() + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+## Mapping Vulnerable Area
+
+```{r}
+dem[is.na(dem)] <- 0
+slope[is.na(slope)] <- 0
+twi[is.na(twi)] <- 0
+dist_str[is.na(dist_str)] <- 0
+dist_coast[is.na(dist_coast)] <- 0
+ndvi[is.na(ndvi)] <- 0
+ndbi[is.na(ndbi)] <- 0
+drain[is.na(drain)] <- 0
+manhole[is.na(manhole)] <- 0
+pump[is.na(pump)] <- 0
+
+df_pred <- c(dem, slope, curv, twi, dist_str, dist_coast, ndvi, ndbi, drain, manhole, pump)
+names(df_pred) <- c("dem", "slope", "curv", "twi", "dist_str", "dist_coast", "ndvi", "ndbi", "drain", "manhole", "pump")
+
+df_pred <- crop(df_pred, ext(c(1110000, 1170000, 1650000, 1720000)))
+
+last_rf_fit %>% extract_fit_parsnip() %>%
+  terra::predict(df_pred) -> r_pred
+
+vect_pred <- r_pred %>% unlist() %>% as.numeric() %>% -1 %>% as.vector() %>%
+  matrix(nrow = dim(df_pred)[1], dim(df_pred)[2], byrow = T) %>%
+  rast(crs = terra::crs(df_pred),
+       extent = terra::ext(df_pred))
+vect_pred[vect_pred == 0] <- NA
+vect_pred <- mask(vect_pred, area)
+
+tmap_mode("view")
+tm_shape(area) + tm_borders() +
+tm_shape(vect_pred) +
+  tm_raster(legend.show = TRUE, palette = "Blues", title = "Vulnerable Area") +
+  tm_scale_bar()
+```
